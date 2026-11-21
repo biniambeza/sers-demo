@@ -1,7 +1,5 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-# Minimal dependencies for the hosted Streamlit demo (demo_app.py).
-# torch is installed separately in the Dockerfile from the CPU-only index.
+# Dependencies for the hosted HCC triage demo (liver_app.py). No torch needed:
+# the hcc_v1 model is PCA + SVM.
 streamlit>=1.67
 plotly>=5.18
 numpy>=1.24
