@@ -147,19 +147,23 @@ def page_screening():
             sample_id = f"SYN-{sample_label}-{sample_num:03d}"
         else:
             uploaded = st.file_uploader(
-                f"Spectrum file (.csv one value per line, or .npy), {len(wavenumbers)} points "
-                f"over {wavenumbers[0]:.0f}–{wavenumbers[-1]:.0f} cm⁻¹",
-                type=["csv", "npy"],
+                f"Spectrum file: {len(wavenumbers)} points over "
+                f"{wavenumbers[0]:.0f}–{wavenumbers[-1]:.0f} cm⁻¹. Renishaw/WiRE .txt "
+                "(wavenumber + intensity columns), .csv, or .npy",
+                type=["txt", "csv", "npy"],
             )
             if uploaded is None:
                 st.info("Upload a spectrum file to begin.")
                 return
             try:
-                if uploaded.name.endswith(".npy"):
-                    spectrum_raw = np.load(uploaded, allow_pickle=False)
+                if uploaded.name.lower().endswith(".npy"):
+                    data = np.load(uploaded, allow_pickle=False)
                 else:
-                    spectrum_raw = np.loadtxt(uploaded, delimiter=",")
-                spectrum_raw = np.asarray(spectrum_raw, dtype=float).ravel()
+                    text = uploaded.getvalue().decode("utf-8", errors="replace").replace(",", " ")
+                    data = np.loadtxt(text.splitlines(), comments="#")
+                data = np.asarray(data, dtype=float)
+                # Two columns = (wavenumber, intensity); otherwise a flat list of intensities
+                spectrum_raw = data[:, 1] if data.ndim == 2 and data.shape[1] == 2 else data.ravel()
             except Exception as exc:  # noqa: BLE001 — show any parse failure to the user
                 st.error(f"Could not read the file: {exc}")
                 return
