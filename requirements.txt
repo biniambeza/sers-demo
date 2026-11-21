@@ -1,9 +1,10 @@
-# Dependencies for the hosted HCC triage demo (liver_app.py). No torch needed:
-# the hcc_v1 model is PCA + SVM.
-streamlit>=1.67
-plotly>=5.18
+# Minimal dependencies for the liver cancer triage app (streamlit_app.py / triage_app.py).
+# Use this file for deployment; requirements.txt also contains the heavy research stack
+# (torch, mlflow, dvc) that the app does not need.
 numpy>=1.24
 scipy>=1.10
 scikit-learn>=1.3
-pandas>=2.0
-joblib>=1.3
+streamlit>=1.40
+plotly>=5.18
+reportlab>=4.0
+matplotlib>=3.7

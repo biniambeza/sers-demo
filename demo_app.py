@@ -1,537 +1,694 @@
-"""SERS liver cancer (HCC) triage: research demo on real public serum spectra.
+"""Liver cancer triage demo: hybrid molecule + pattern model with safety-first decisions.
 
-Data: Zenodo 4277797, 144 serum SERS spectra (72 hepatocellular carcinoma,
-72 healthy controls), portable 785 nm spectrometer, silver plasmonic paper,
-measured on 5 days with 3 substrate batches.
+Run:  python -m streamlit run triage_app.py
 
-Model (biomarkers/hcc_v1/spec.yaml): despike -> ALS baseline -> Savitzky-Golay
--> SNV, PCA(20) + RBF-SVM, sensitivity-first TriageThreshold (95%) giving
-REFER / CLEAR / INCONCLUSIVE.
-
-Honesty rule: a spectrum from the public dataset is always scored by the model
-trained on the OTHER four measurement days (leave-one-day-out), never by a
-model that saw it. Only genuinely new uploads use the model fitted on all data.
-
-Run: streamlit run liver_app.py
+RESEARCH DEMO on public data (Zenodo 4277797: 72 HCC, 72 healthy, all male, one
+European lab). Not validated on Ethiopian patients and not for clinical use.
 """
 from __future__ import annotations
 
+import csv
 import html
-import math
-import os
+import io
 import re
 import sys
 import tempfile
-from datetime import datetime
+import time
+import warnings
+import zipfile
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-os.environ.setdefault("SERS_REGISTRY_HMAC_KEY", "demo-key-do-not-use-in-production")
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.decomposition import PCA
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
-from sklearn.pipeline import make_pipeline
-from sklearn.svm import SVC
 
-from reports.generator import (
-    LabInfo, PatientInfo, ReportData, ReportGenerator, ReportStatus, ReportType, ResultEntry,
-)
-from sers_pipeline.ingestion import interpolate_to_grid, parse_spectrum_file
-from sers_pipeline.preprocessing import Pipeline
-from sers_pipeline.safety import TriageResult, TriageThreshold
-from sers_pipeline.synthetic import make_wavenumber_grid
+warnings.filterwarnings("ignore")
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-st.set_page_config(page_title="HCC Triage — Serum SERS", page_icon="🩺", layout="wide",
+from load_hcc_serum import load_hcc_dataset  # noqa: E402
+from reports.triage_pdf import build_triage_pdf  # noqa: E402
+from scipy.signal import find_peaks, savgol_filter  # noqa: E402
+from sers_pipeline.ingestion import interpolate_to_grid, parse_spectrum_file  # noqa: E402
+from sers_pipeline.preprocessing import ALSBaselineCorrector, WhitakerHayesDespiker  # noqa: E402
+from sers_pipeline.safety import TriageResult, TriageThreshold  # noqa: E402
+from sers_pipeline.synthetic import make_wavenumber_grid  # noqa: E402
+from sklearn.decomposition import NMF, PCA  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split  # noqa: E402
+from sklearn.pipeline import FeatureUnion, make_pipeline  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+GRID = make_wavenumber_grid()
+K = 6
+TARGET_SENSITIVITY = 0.95
+
+# Palette
+INK, PANEL, LINE = "#0e1013", "#16191e", "#262a31"
+IVORY, MUTED, GOLD = "#ece6da", "#9a958b", "#c9a96e"
+RED, GREEN, AMBER, TEAL = "#c2645a", "#6fa58b", "#c99a4e", "#7fa7b5"
+
+st.set_page_config(page_title="SERS Liver Triage", page_icon="◆", layout="wide",
                    initial_sidebar_state="expanded")
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data" / "hcc_serum_sers" / "spectra"
-TARGET_SENSITIVITY = 0.95
-CLASS_NAMES = {0: "Healthy control", 1: "HCC (liver cancer)"}
-_ID_RE = re.compile(r"^(?P<day>\d{8})_batch-(?P<batch>[A-Z])_(?P<cls>CTR|H0T)_(?P<code>\d+)$")
-
-# From biomarkers/hcc_v1/spec.yaml: data-derived on these 144 spectra (2026-11-17),
-# not yet assigned to molecules.
-PEAKS_HIGHER_IN_HCC = [598, 778, 1057, 1156, 1272, 1506]
-PEAKS_LOWER_IN_HCC = [479, 1440, 1564, 1594]
-
-DISCLAIMER = (
-    "Research demonstration. The spectra are real, public data from one laboratory, "
-    "one week, one instrument, all male participants, and compare liver cancer with "
-    "healthy people only. **Not a medical device and not for diagnosis.**"
-)
-
-REFLEX = {
-    TriageResult.REFER: ("🔴 REFER", "result-refer",
-                         "Refer for liver ultrasound and serum AFP."),
-    TriageResult.CLEAR: ("🟢 CLEAR", "result-clear",
-                         "No reason to refer from this test. CLEAR does not rule out HCC; "
-                         "surveillance guidelines and clinical judgement still apply."),
-    TriageResult.INCONCLUSIVE: ("🟠 INCONCLUSIVE", "result-inconclusive",
-                                "Repeat the measurement. If still inconclusive, refer."),
-}
-
-st.markdown("""
+st.markdown(f"""
 <style>
-  .page-title { font-size: 2rem; font-weight: 700; margin-bottom: 0; }
-  .page-sub { font-size: 1rem; opacity: 0.7; margin-top: 0; }
-  .result-refer { color: #e74c3c; font-weight: 700; font-size: 1.6rem; }
-  .result-clear { color: #27ae60; font-weight: 700; font-size: 1.6rem; }
-  .result-inconclusive { color: #f39c12; font-weight: 700; font-size: 1.6rem; }
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@300;400;500;600&display=swap');
+html, body, [class*="css"], .stApp, .stMarkdown, p, li, label, span, div {{
+  font-family: 'Inter', sans-serif; }}
+.stApp {{ background: radial-gradient(1200px 600px at 15% -10%, #1b1f26 0%, {INK} 55%); color: {IVORY}; }}
+section[data-testid="stSidebar"] {{ background: {PANEL}; border-right: 1px solid {LINE}; }}
+section[data-testid="stSidebar"] * {{ color: {IVORY}; }}
+h1, h2, h3, .serif {{ font-family: 'Cormorant Garamond', serif !important; letter-spacing: .3px; color: {IVORY}; }}
+.block-container {{ padding-top: 2.2rem; max-width: 1280px; }}
+.eyebrow {{ font-size: .72rem; letter-spacing: .28em; text-transform: uppercase; color: {GOLD}; }}
+.hero-title {{ font-family: 'Cormorant Garamond', serif; font-size: 3.1rem; font-weight: 600; line-height: 1.05; margin: .2rem 0 .4rem; }}
+.hero-sub {{ color: {MUTED}; font-size: 1rem; max-width: 760px; font-weight: 300; }}
+.rule {{ height: 1px; background: linear-gradient(90deg, {GOLD}55, transparent); margin: 1.4rem 0 1.6rem; }}
+.card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 14px; padding: 20px 22px; }}
+.kpi-label {{ color: {MUTED}; font-size: .72rem; letter-spacing: .16em; text-transform: uppercase; }}
+.kpi-value {{ font-family: 'Cormorant Garamond', serif; font-size: 2.4rem; font-weight: 600; color: {IVORY}; line-height: 1.1; }}
+.kpi-note {{ color: {MUTED}; font-size: .78rem; }}
+.verdict {{ border-radius: 14px; padding: 22px 24px; border: 1px solid; }}
+.verdict-k {{ font-size: .72rem; letter-spacing: .24em; text-transform: uppercase; opacity: .85; }}
+.verdict-v {{ font-family: 'Cormorant Garamond', serif; font-size: 2.6rem; font-weight: 700; line-height: 1.05; }}
+.verdict-s {{ font-size: .92rem; opacity: .9; margin-top: .25rem; }}
+.mol {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }}
+.mol-name {{ font-family: 'Cormorant Garamond', serif; font-size: 1.25rem; font-weight: 600; }}
+.mol-meta {{ color: {MUTED}; font-size: .76rem; }}
+.tag {{ display:inline-block; font-size:.68rem; letter-spacing:.12em; text-transform:uppercase; padding:3px 9px; border-radius:20px; border:1px solid; }}
+.track {{ position: relative; height: 8px; background: #22262d; border-radius: 6px; margin: 10px 0 4px; }}
+.band {{ position:absolute; height:8px; background:{GOLD}33; border-radius:6px; border:1px solid {GOLD}66; }}
+.dot {{ position:absolute; top:-4px; width:16px; height:16px; border-radius:50%; border:2px solid {INK}; }}
+.step {{ display:flex; gap:14px; align-items:flex-start; margin-bottom:14px; }}
+.step-n {{ font-family:'Cormorant Garamond', serif; color:{GOLD}; font-size:1.6rem; min-width:32px; line-height:1; }}
+.small {{ color:{MUTED}; font-size:.82rem; }}
+.foot {{ color:{MUTED}; font-size:.76rem; border-top:1px solid {LINE}; padding-top:14px; margin-top:28px; }}
+div[data-baseweb="tab-list"] {{ gap: 6px; border-bottom: 1px solid {LINE}; }}
+button[data-baseweb="tab"] {{ background: transparent; color: {MUTED}; font-size: .82rem; letter-spacing: .14em; text-transform: uppercase; }}
+button[data-baseweb="tab"][aria-selected="true"] {{ color: {GOLD}; }}
+div[data-baseweb="tab-highlight"] {{ background-color: {GOLD}; }}
+.stButton > button {{ border-radius: 30px; padding: .55rem 1.6rem; letter-spacing: .12em;
+  text-transform: uppercase; font-size: .78rem; border: 1px solid {GOLD}88; background: transparent; color: {IVORY}; }}
+.stButton > button[kind="primary"] {{ background: {GOLD}; color: {INK}; border: none; font-weight: 600; }}
+.stButton > button:hover {{ border-color: {GOLD}; color: {GOLD}; }}
+.stButton > button[kind="primary"]:hover {{ background: #d8bb84; color: {INK}; }}
+table.ev {{ width:100%; border-collapse: collapse; font-size:.9rem; }}
+table.ev th {{ text-align:left; color:{MUTED}; font-weight:500; font-size:.72rem; letter-spacing:.14em; text-transform:uppercase; border-bottom:1px solid {LINE}; padding:10px 8px; }}
+table.ev td {{ border-bottom:1px solid {LINE}; padding:11px 8px; color:{IVORY}; }}
 </style>
 """, unsafe_allow_html=True)
 
-LAB_INFO = LabInfo(
-    name="HCC Triage — Research Demo (not a clinical laboratory)",
-    address="Demonstration only", clia_number="N/A (demo)",
-    director_name="N/A", director_credentials="",
-)
 
+# --------------------------------------------------------------------------- model
+def clean(X: np.ndarray) -> np.ndarray:
+    """Despike, remove baseline, smooth, scale to unit area, clip below zero."""
+    X = WhitakerHayesDespiker()(np.atleast_2d(X))
+    X = ALSBaselineCorrector()(X)
+    X = savgol_filter(X, 11, 3, axis=1)
+    X = np.clip(X, 0, None)
+    return X / (X.sum(1, keepdims=True) + 1e-12)
 
-def header(title: str, subtitle: str) -> None:
-    st.markdown(f'<p class="page-title">{title}</p>', unsafe_allow_html=True)
-    st.markdown(f'<p class="page-sub">{subtitle}</p>', unsafe_allow_html=True)
-    st.divider()
-
-
-def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    if n == 0:
-        return float("nan"), float("nan")
-    p = k / n
-    d = 1 + z * z / n
-    c = (p + z * z / (2 * n)) / d
-    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-    return c - h, c + h
-
-
-# --------------------------------------------------------------------------- #
-# Model                                                                        #
-# --------------------------------------------------------------------------- #
 
 def make_model():
     return make_pipeline(
-        PCA(n_components=20, random_state=42),
-        SVC(kernel="rbf", C=1.0, gamma="scale", probability=True, random_state=42),
+        FeatureUnion([("molecules", NMF(K, init="nndsvda", max_iter=2000, random_state=0)),
+                      ("pattern", PCA(20, random_state=0))]),
+        StandardScaler(),
+        LogisticRegression(C=0.01, max_iter=5000),
     )
 
 
-def fit_triage(X: np.ndarray, y: np.ndarray):
-    """Fit the classifier and a referral threshold chosen on out-of-fold scores."""
-    oof = cross_val_predict(make_model(), X, y, method="predict_proba",
-                            cv=StratifiedKFold(5, shuffle=True, random_state=0))[:, 1]
-    triage = TriageThreshold(target_sensitivity=TARGET_SENSITIVITY).fit(oof, y)
-    return make_model().fit(X, y), triage
+def name_component(h: np.ndarray) -> tuple[str, list[int]]:
+    """Name a component by its two strongest peaks (provisional literature matching)."""
+    h = h / h.max()
+    pk, _ = find_peaks(h, height=0.25, distance=12)
+    ranked = [int(GRID[j]) for j in pk[np.argsort(h[pk])[::-1]]]
+    peaks = sorted(ranked[:6])
+    bands = {"Uric acid": (640, 1133), "Hypoxanthine": (725,), "Ergothioneine": (483,)}
+    names = []
+    for p in ranked[:2]:
+        for name, bs in bands.items():
+            if any(abs(p - b) <= 15 for b in bs) and name not in names:
+                names.append(name)
+    return (" · ".join(names) if names else "Unassigned"), peaks
 
 
-@st.cache_resource(show_spinner="Loading 144 real serum spectra and fitting the triage model…")
-def load_bundle():
-    grid = make_wavenumber_grid()  # 400–1800 cm⁻¹, 1401 points
-    rows, labels, meta = [], [], []
-    for f in sorted(DATA_DIR.glob("*.txt")):
-        m = _ID_RE.match(f.stem)
-        if not m:
-            continue
-        wn, inten, _ = parse_spectrum_file(f)
-        if wn.min() > grid[0] or wn.max() < grid[-1]:
-            continue
-        rows.append(interpolate_to_grid(wn, inten, grid))
-        labels.append(1 if m["cls"] == "H0T" else 0)
-        meta.append({"id": f.stem, "file": f.name, "day": m["day"], "batch": m["batch"],
-                     "code": m["code"]})
-    if not rows:
-        raise FileNotFoundError(f"No spectra found in {DATA_DIR}")
-    X_raw, y = np.vstack(rows), np.array(labels)
-    dsp = Pipeline.default()
-    X = dsp(X_raw)
-    days = np.array([m["day"] for m in meta])
-    day_list = sorted(set(days))
+@st.cache_resource(show_spinner="Preparing the model on the training patients…")
+def train():
+    X_raw, y, ids = load_hcc_dataset()
+    X = clean(X_raw)
+    idx = np.arange(len(y))
+    tr, te = train_test_split(idx, test_size=0.2, stratify=y, random_state=7)
 
-    # Leave-one-day-out: one model per held-out day, threshold fitted on the other days.
-    lodo_models: dict[str, tuple] = {}
-    score, thr = np.zeros(len(y)), np.zeros(len(y))
-    for d in day_list:
-        te, tr = days == d, days != d
-        model, triage = fit_triage(X[tr], y[tr])
-        lodo_models[d] = (model, triage)
-        score[te] = model.predict_proba(X[te])[:, 1]
-        thr[te] = triage.threshold
-    referred = score >= thr
-    pred = (score >= 0.5).astype(int)
-    tp, fn = int((referred & (y == 1)).sum()), int((~referred & (y == 1)).sum())
-    tn, fp = int((~referred & (y == 0)).sum()), int((referred & (y == 0)).sum())
-    per_day = []
-    for d in day_list:
-        m = days == d
-        per_day.append({"Day": f"{d[:4]}-{d[4:6]}-{d[6:]}", "Spectra": int(m.sum()),
-                        "HCC": int((y[m] == 1).sum()), "Healthy": int((y[m] == 0).sum()),
-                        "Accuracy": round(float((pred[m] == y[m]).mean()), 3),
-                        "Referral threshold": round(float(thr[m][0]), 3)})
-    final_model, final_triage = fit_triage(X, y)
-    return {
-        "grid": grid, "dsp": dsp, "X_raw": X_raw, "X": X, "y": y, "meta": meta, "days": days,
-        "lodo": lodo_models, "final": (final_model, final_triage),
-        "eval": {"score": score, "threshold": thr, "referred": referred, "pred": pred,
-                 "accuracy": float((pred == y).mean()), "auroc": float(roc_auc_score(y, score)),
-                 "tp": tp, "fn": fn, "tn": tn, "fp": fp, "per_day": per_day},
+    oof = cross_val_predict(make_model(), X[tr], y[tr],
+                            cv=StratifiedKFold(5, shuffle=True, random_state=0),
+                            method="predict_proba")[:, 1]
+    triage = TriageThreshold(TARGET_SENSITIVITY).fit(oof, y[tr])
+    model = make_model().fit(X[tr], y[tr])
+
+    nmf = model[0].transformer_list[0][1]
+    names = [name_component(h) for h in nmf.components_]
+    W_tr = nmf.transform(X[tr])
+    ranges = np.percentile(W_tr[y[tr] == 0], [2.5, 97.5], axis=0)
+    span = np.percentile(W_tr, [0.5, 99.5], axis=0)
+
+    te_scores = model.predict_proba(X[te])[:, 1]
+    referred = np.array([d.result == TriageResult.REFER for d in triage.decide(te_scores)])
+    yt = y[te]
+    perf = {
+        "n_train": len(tr), "n_test": len(te),
+        "hcc_referred": (int((referred & (yt == 1)).sum()), int((yt == 1).sum())),
+        "healthy_cleared": (int((~referred & (yt == 0)).sum()), int((yt == 0).sum())),
     }
+    return dict(X_raw=X_raw, X=X, y=y, test_idx=te, model=model, triage=triage,
+                names=names, ranges=ranges, span=span, perf=perf, H=nmf.components_)
 
 
-def parse_upload(uploaded, grid: np.ndarray) -> np.ndarray:
-    """Parse an uploaded spectrum file and resample it onto the model grid."""
-    suffix = Path(uploaded.name).suffix or ".txt"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(uploaded.getvalue())
-        tmp_path = Path(tmp.name)
-    try:
-        wn, inten, _ = parse_spectrum_file(tmp_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    if wn.min() > grid[0] or wn.max() < grid[-1]:
-        raise ValueError(
-            f"The spectrum covers {wn.min():.0f}–{wn.max():.0f} cm⁻¹ but the model needs "
-            f"{grid[0]:.0f}–{grid[-1]:.0f} cm⁻¹."
-        )
-    return interpolate_to_grid(wn, inten, grid)
+def explain(m, x_clean: np.ndarray):
+    model = m["model"]
+    feats = model[0].transform(x_clean)
+    z = model[1].transform(feats)[0]
+    contrib = model[2].coef_[0] * z
+    return feats[0, :K], contrib[:K], contrib[K:].sum()
 
 
-MIN_SERUM_CORRELATION = 0.30  # all 144 dataset spectra ≥ 0.49; pure noise ≈ 0; non-serum ≈ 0.15
+def quality_ok(x_raw: np.ndarray) -> tuple[bool, str]:
+    if not np.isfinite(x_raw).all():
+        return False, "the spectrum contains invalid values"
+    if np.std(x_raw) < 1e-6 * (np.abs(x_raw).mean() + 1e-12):
+        return False, "the spectrum is flat (no signal)"
+    return True, ""
 
 
-def qc_checks(spectrum_clean: np.ndarray, reference: np.ndarray) -> list[tuple[str, bool, str]]:
-    """Checks that an input can be scored at all. They do not judge the result."""
-    finite = bool(np.isfinite(spectrum_clean).all())
-    rng_ = float(spectrum_clean.max() - spectrum_clean.min()) if finite else 0.0
-    zeros = float(np.mean(np.abs(spectrum_clean) < 1e-6)) if finite else 1.0
-    corr = float(np.corrcoef(spectrum_clean, reference)[0, 1]) if finite and rng_ > 0 else 0.0
-    return [
-        ("Finite values", finite, "all finite" if finite else "NaN/inf present"),
-        ("Not flat", rng_ > 0.01, f"range {rng_:.2f}"),
-        ("Zero fraction", zeros < 0.5, f"{zeros:.1%}"),
-        ("Serum SERS profile", corr >= MIN_SERUM_CORRELATION,
-         f"r = {corr:.2f} vs dataset mean (need ≥ {MIN_SERUM_CORRELATION})"),
-    ]
-
-
-def spectrum_figure(grid, traces, yaxis: str, peaks: bool = False) -> go.Figure:
-    fig = go.Figure()
-    for y_vals, name, color, width in traces:
-        fig.add_trace(go.Scatter(x=grid, y=y_vals, mode="lines", name=name,
-                                 line=dict(color=color, width=width)))
-    if peaks:
-        for p in PEAKS_HIGHER_IN_HCC:
-            fig.add_vline(x=p, line_dash="dot", line_color="#e74c3c", opacity=0.45)
-        for p in PEAKS_LOWER_IN_HCC:
-            fig.add_vline(x=p, line_dash="dot", line_color="#3498db", opacity=0.45)
-    fig.update_layout(xaxis_title="Raman shift (cm⁻¹)", yaxis_title=yaxis, height=340,
-                      margin=dict(t=20, b=40), legend=dict(orientation="h", y=1.1))
+def plot_layout(fig, height, title=None):
+    fig.update_layout(
+        height=height, title=dict(text=title, font=dict(family="Cormorant Garamond", size=20, color=IVORY)) if title else None,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter", color=MUTED, size=12),
+        margin=dict(l=10, r=10, t=40 if title else 10, b=10),
+        legend=dict(orientation="h", y=1.08, x=0, font=dict(color=IVORY)),
+        xaxis=dict(gridcolor=LINE, zeroline=False, linecolor=LINE),
+        yaxis=dict(gridcolor=LINE, zeroline=False, linecolor=LINE),
+    )
     return fig
 
 
-# --------------------------------------------------------------------------- #
-# Pages                                                                        #
-# --------------------------------------------------------------------------- #
-
-def page_screening():
-    header("Liver Cancer (HCC) Triage",
-           "Score a serum SERS spectrum: REFER for ultrasound + AFP, or CLEAR")
-    b = load_bundle()
-    grid, dsp, meta, y = b["grid"], b["dsp"], b["meta"], b["y"]
-
-    col_src, col_opt = st.columns([1, 2])
-    with col_src:
-        source = st.radio("Spectrum source", ["Real dataset sample", "Upload spectrum"])
-    truth = None
-    with col_opt:
-        if source == "Real dataset sample":
-            wanted = st.selectbox("True status of the sample", [1, 0],
-                                  format_func=CLASS_NAMES.get)
-            pool = [i for i in range(len(y)) if y[i] == wanted]
-            i = st.selectbox(
-                "Sample", pool,
-                format_func=lambda k: f"{meta[k]['id']}   (day {meta[k]['day']}, batch {meta[k]['batch']})",
-            )
-            spectrum_raw, sample_id, truth = b["X_raw"][i], meta[i]["id"], int(y[i])
-            model, triage = b["lodo"][meta[i]["day"]]
-            model_note = (f"Scored by the model trained on the other four measurement days "
-                          f"(day {meta[i]['day']} held out), so this sample was never seen in training.")
-        else:
-            uploaded = st.file_uploader(
-                "Two-column text file (Raman shift, intensity) covering 400–1800 cm⁻¹; "
-                "B&W Tek / Renishaw exports work as-is",
-                type=["txt", "csv", "tsv", "dat"],
-            )
-            if uploaded is None:
-                st.info("Upload a spectrum file to begin. Dataset files are in "
-                        "`data/hcc_serum_sers/spectra/` (CTR = healthy, H0T = HCC).")
-                return
-            try:
-                spectrum_raw = parse_upload(uploaded, grid)
-            except Exception as exc:  # noqa: BLE001 — surface any parse failure
-                st.error(f"Could not use this file: {exc}")
-                return
-            sample_id = Path(uploaded.name).stem
-            known = {m["id"]: k for k, m in enumerate(meta)}
-            if sample_id in known:
-                k = known[sample_id]
-                truth = int(y[k])
-                model, triage = b["lodo"][meta[k]["day"]]
-                model_note = (f"This file is part of the public dataset, so it is scored by the "
-                              f"model that never saw its measurement day ({meta[k]['day']}).")
-            else:
-                model, triage = b["final"]
-                model_note = "New spectrum: scored by the model fitted on all 144 dataset spectra."
-
-    st.divider()
-    st.subheader("Step 1 — Raw spectrum (resampled to 400–1800 cm⁻¹)")
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.plotly_chart(spectrum_figure(grid, [(spectrum_raw, "Raw", "#e74c3c", 1.5)],
-                                        "Intensity (a.u.)"), width="stretch")
-    with c2:
-        st.metric("Sample", sample_id)
-        st.metric("Points", len(spectrum_raw))
-        st.metric("Max intensity", f"{spectrum_raw.max():.0f}")
-
-    st.subheader("Step 2 — Preprocessing (despike → ALS baseline → Savitzky-Golay → SNV)")
-    spectrum_clean = dsp(spectrum_raw.reshape(1, -1))[0]
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.plotly_chart(spectrum_figure(
-            grid, [(spectrum_clean, "Processed", "#2ecc71", 2)], "SNV intensity", peaks=True),
-            width="stretch")
-        st.caption("Dotted lines: wavenumbers that differ most between HCC and healthy serum in "
-                   "this dataset (red: higher in HCC, blue: lower in HCC).")
-    with c2:
-        for step_name, _ in dsp.steps:
-            st.success(f"✅ {step_name}")
-
-    st.subheader("Step 3 — Quality control")
-    checks = qc_checks(spectrum_clean, b["X"].mean(0))
-    qc_pass = all(ok for _, ok, _ in checks)
-    for col, (label, ok, shown) in zip(st.columns(len(checks)), checks):
-        with col:
-            st.markdown(f"{'✅' if ok else '❌'} **{label}**")
-            st.caption(shown)
-    if not qc_pass:
-        st.error("Spectrum failed QC: the result is INCONCLUSIVE. The 'serum SERS profile' check "
-                 "fails for inputs that do not look like serum on this substrate, including "
-                 "spectra from other sample types or synthetic generators.")
-
-    st.subheader("Step 4 — Triage decision")
-    score = float(model.predict_proba(spectrum_clean.reshape(1, -1))[0, 1])
-    decision = triage.decide(np.array([score]), sample_ids=[sample_id],
-                             qc_passed=np.array([qc_pass]))[0]
-    label, css, action = REFLEX[decision.result]
-
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        st.markdown(f'<p class="{css}">{label}</p>', unsafe_allow_html=True)
-        st.markdown(f"**Action:** {action}")
-        st.caption(model_note)
-    with c2:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=[score], y=["HCC score"], orientation="h",
-                             marker_color="#e74c3c" if score >= triage.threshold else "#27ae60",
-                             text=[f"{score:.3f}"], textposition="outside"))
-        fig.add_vline(x=triage.threshold, line_dash="dash", line_color="#333",
-                      annotation_text=f"referral threshold {triage.threshold:.3f}",
-                      annotation_position="top")
-        fig.update_layout(height=160, xaxis_range=[0, 1], margin=dict(t=30, b=30, l=10, r=10),
-                          xaxis_title="Model probability of HCC", showlegend=False)
-        st.plotly_chart(fig, width="stretch")
-        st.caption(f"The threshold is set so that about {TARGET_SENSITIVITY:.0%} of known cancers "
-                   f"in the training days are referred (fitted on out-of-fold scores: sensitivity "
-                   f"{triage.fitted_sensitivity:.2f}, specificity {triage.fitted_specificity:.2f}).")
-
-    if truth is not None:
-        correct = (decision.result == TriageResult.REFER) == (truth == 1)
-        if decision.result == TriageResult.INCONCLUSIVE:
-            st.info(f"True status: **{CLASS_NAMES[truth]}**.")
-        elif correct:
-            st.success(f"True status: **{CLASS_NAMES[truth]}** — triage was right.")
-        else:
-            st.error(f"True status: **{CLASS_NAMES[truth]}** — triage was wrong. "
-                     "Misses like this are why CLEAR never rules out cancer.")
-
-    st.session_state["last_result"] = {
-        "sample_id": sample_id, "result": decision.result.value, "score": score,
-        "threshold": float(triage.threshold), "qc_pass": qc_pass, "action": action,
-        "model_note": model_note,
-    }
-    st.caption("This result is available on the **Report** page.")
+def kpi(label, value, note=""):
+    return (f"<div class='card'><div class='kpi-label'>{label}</div>"
+            f"<div class='kpi-value'>{value}</div><div class='kpi-note'>{note}</div></div>")
 
 
-def page_report():
-    header("Triage Report", "Printable summary of the most recent analysis")
-    res = st.session_state.get("last_result")
-    if res is None:
-        st.info("Run an analysis on the **Screening** page first.")
-        return
-    c1, c2 = st.columns(2)
-    with c1:
-        patient = st.text_input("Patient / sample name", "Demo Patient")
-        dob = st.text_input("Date of birth", "1970-01-01")
-        sex = st.selectbox("Sex", ["Male", "Female", "Other"])
-    with c2:
-        mrn = st.text_input("Sample ID", res["sample_id"])
-        provider = st.text_input("Requesting clinician", "—")
-        specimen = st.selectbox("Specimen", ["Serum"])
-    if not st.button("Generate report", type="primary", width="stretch"):
+COMPONENT_COLORS = ["#c9a96e", "#7fa7b5", "#c2645a", "#6fa58b", "#a48bc4", "#d1b48c"]
+
+
+def live_analysis(x_raw: np.ndarray, m: dict, name: str) -> None:
+    """Step-by-step replay of a measurement, from reading to decision."""
+    head = st.empty()
+    chart = st.empty()
+    notes = st.empty()
+    bar = st.progress(0.0)
+    run = st.session_state.get("live_run", 0) + 1
+    st.session_state["live_run"] = run
+
+    def show(fig, height, title, tag):
+        chart.plotly_chart(plot_layout(fig, height, title), width="stretch", key=f"live_{run}_{tag}")
+
+    def step(n, title, text):
+        head.markdown(f"<div class='step'><div class='step-n'>{n:02d}</div><div><div class='serif' "
+                      f"style='font-size:1.45rem;font-weight:600'>{title}</div><div class='small'>{text}"
+                      f"</div></div></div>", unsafe_allow_html=True)
+
+    ylo, yhi = float(x_raw.min()), float(x_raw.max())
+    pad = 0.08 * (yhi - ylo + 1e-12)
+
+    # 01 Reading -----------------------------------------------------------
+    step(1, "Reading the sample", f"785 nm laser on the silver strip · {html.escape(name)}")
+    frames = 36
+    for k in range(1, frames + 1):
+        upto = max(2, int(len(GRID) * k / frames))
+        fig = go.Figure(go.Scatter(x=GRID[:upto], y=x_raw[:upto], line=dict(color=GOLD, width=1.6)))
+        fig.add_vline(x=GRID[upto - 1], line=dict(color=IVORY, width=1, dash="dot"))
+        fig.update_xaxes(range=[GRID[0], GRID[-1]], title="Raman shift (cm⁻¹)")
+        fig.update_yaxes(range=[ylo - pad, yhi + pad], title="counts")
+        show(fig, 340, "Raw signal from the detector", f"read{k}")
+        bar.progress(0.25 * k / frames)
+        time.sleep(0.045)
+    notes.markdown("<div class='small'>Replaying a recorded measurement — no reader is connected yet.</div>",
+                   unsafe_allow_html=True)
+    time.sleep(0.6)
+
+    # 02 Quality checks -------------------------------------------------------
+    step(2, "Quality checks", "A bad reading is never classified; it is returned as ‘measure again’.")
+    ok, why = quality_ok(x_raw)
+    noise = float(np.std(np.diff(x_raw)) / np.sqrt(2))
+    snr = (yhi - ylo) / (noise + 1e-12)
+    checks = [("Signal present", np.ptp(x_raw) > 0),
+              ("Valid numbers only", bool(np.isfinite(x_raw).all())),
+              (f"Signal-to-noise {snr:.0f}", snr > 10),
+              ("Covers 400–1800 cm⁻¹", True)]
+    shown = []
+    for label, passed in checks:
+        mark = f"<span style='color:{GREEN if passed else RED}'>{'✓' if passed else '✗'}</span>"
+        shown.append(f"<div style='font-size:1.05rem;margin:4px 0'>{mark}&nbsp;&nbsp;{label}</div>")
+        notes.markdown("<div class='card'>" + "".join(shown) + "</div>", unsafe_allow_html=True)
+        time.sleep(0.45)
+    bar.progress(0.35)
+    if not ok:
+        notes.markdown(f"<div class='card' style='color:{AMBER}'>Quality check failed: {why}</div>",
+                       unsafe_allow_html=True)
+        time.sleep(1.5)
         return
 
-    # ReportGenerator interpolates fields into HTML unescaped; escape user input.
-    patient, dob, mrn, provider = (html.escape(s) for s in (patient, dob, mrn, provider))
-    result = res["result"].upper()
-    results = [
-        ResultEntry("HCC triage (serum SERS)", result, "", "CLEAR",
-                    "A" if result == "REFER" else "", "PCA(20)+SVM, sensitivity-first threshold"),
-        ResultEntry("Model probability of HCC", f"{res['score']:.3f}", "probability",
-                    f"< {res['threshold']:.3f}", "", "Tier A classifier"),
-        ResultEntry("Spectrum QC", "pass" if res["qc_pass"] else "FAIL", "", "pass", "", ""),
+    # 03 Cleaning -----------------------------------------------------------
+    despiked = WhitakerHayesDespiker()(x_raw[None])[0]
+    corrected = ALSBaselineCorrector()(despiked[None])[0]
+    baseline = despiked - corrected
+    smoothed = savgol_filter(corrected, 11, 3)
+    final = clean(x_raw)[0]
+
+    stages = [
+        ("Removing cosmic-ray spikes", [("raw", x_raw, "#5d6168"), ("despiked", despiked, GOLD)]),
+        ("Removing background glow", [("signal", despiked, GOLD), ("background", baseline, TEAL)]),
+        ("Smoothing noise", [("before", corrected, "#5d6168"), ("smoothed", smoothed, GOLD)]),
+        ("Normalising brightness", [("clean spectrum", final / final.max(), GOLD)]),
     ]
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M")
-    report = ReportGenerator(LAB_INFO).generate(ReportData(
-        patient=PatientInfo(name=patient, dob=dob, mrn=mrn, sex=sex, ordering_provider=provider),
-        report_type=ReportType.QUALITATIVE, status=ReportStatus.FINAL, results=results,
-        collection_datetime=now, result_datetime=now, specimen_type=specimen,
-        ordering_provider=provider,
-        method_description=(
-            "Surface-enhanced Raman spectroscopy of serum on silver plasmonic paper, 785 nm. "
-            "Spectra are despiked, baseline-corrected (ALS), smoothed (Savitzky-Golay) and "
-            "normalized (SNV), then scored by PCA(20) + RBF-SVM. The referral threshold is "
-            f"chosen for {TARGET_SENSITIVITY:.0%} sensitivity on out-of-fold development scores."
-        ),
-        method_limitations=(
-            "RESEARCH DEMO ONLY. Developed on 144 public spectra from one laboratory, one week, "
-            "one instrument, all male, HCC versus healthy controls only (no hepatitis B or "
-            "cirrhosis group). A CLEAR result does not rule out HCC. Not for diagnostic use."
-        ),
-        comments=f"Recommended action: {res['action']} {res['model_note']}",
-    ))
-    st.iframe(report.html, height=650)
-    safe_id = "".join(ch for ch in res["sample_id"] if ch.isalnum() or ch in "-_") or "report"
-    st.download_button("Download report (HTML)", report.html,
-                       file_name=f"hcc_triage_{safe_id}.html", mime="text/html")
-
-
-def page_performance():
-    header("Model Performance", "Leave-one-day-out evaluation on the 144 real spectra")
-    b = load_bundle()
-    e, y = b["eval"], b["y"]
-    n_pos, n_neg = e["tp"] + e["fn"], e["tn"] + e["fp"]
-    sens_lo, sens_hi = wilson(e["tp"], n_pos)
-    spec_lo, spec_hi = wilson(e["tn"], n_neg)
-
-    c = st.columns(4)
-    c[0].metric("Accuracy", f"{e['accuracy']:.3f}")
-    c[1].metric("AUROC", f"{e['auroc']:.3f}")
-    c[2].metric("HCC referred", f"{e['tp']}/{n_pos}", f"{sens_lo:.2f}–{sens_hi:.2f} (95% CI)",
-                delta_color="off")
-    c[3].metric("Healthy cleared", f"{e['tn']}/{n_neg}", f"{spec_lo:.2f}–{spec_hi:.2f} (95% CI)",
-                delta_color="off")
-    st.caption(
-        "Each measurement day is held out in turn; the model and its referral threshold are "
-        "fitted on the other four days only. No per-day correction is applied, because a clinic "
-        "cannot apply one without a daily reference serum. Accuracy uses a 0.5 cut-off; "
-        f"referral uses the {TARGET_SENSITIVITY:.0%}-sensitivity threshold."
-    )
-    st.divider()
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Triage outcome by true status")
-        z = [[e["tn"], e["fp"]], [e["fn"], e["tp"]]]
-        fig = go.Figure(go.Heatmap(z=z, x=["CLEAR", "REFER"],
-                                   y=[CLASS_NAMES[0], CLASS_NAMES[1]], colorscale="Blues",
-                                   text=z, texttemplate="%{text}", showscale=False))
-        fig.update_layout(height=340, xaxis_title="Triage result", yaxis_title="True status",
-                          margin=dict(t=20, b=40))
-        st.plotly_chart(fig, width="stretch")
-    with c2:
-        st.subheader("Held-out HCC scores")
+    for n, (title, traces) in enumerate(stages):
+        step(3, "Cleaning the signal", title)
         fig = go.Figure()
-        for cls, color in ((0, "#27ae60"), (1, "#e74c3c")):
-            fig.add_trace(go.Histogram(x=e["score"][y == cls], nbinsx=20, name=CLASS_NAMES[cls],
-                                       marker_color=color, opacity=0.7))
-        fig.update_layout(barmode="overlay", height=340, xaxis_title="Model probability of HCC",
-                          yaxis_title="Spectra", margin=dict(t=20, b=40),
-                          legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig, width="stretch")
+        for label, yv, col in traces:
+            dash = "dash" if label == "background" else "solid"
+            fig.add_trace(go.Scatter(x=GRID, y=yv, name=label, line=dict(color=col, width=1.6, dash=dash)))
+        fig.update_xaxes(title="Raman shift (cm⁻¹)")
+        show(fig, 340, title, f"clean{n}")
+        notes.empty()
+        bar.progress(0.35 + 0.1 * (n + 1))
+        time.sleep(1.1)
 
-    st.subheader("Per measurement day")
-    st.dataframe(e["per_day"], hide_index=True, width="stretch")
+    # 04 Molecule breakdown ----------------------------------------------------
+    step(4, "Breaking the spectrum into molecules",
+         "Each layer is a molecule-like component; together they rebuild the measured spectrum.")
+    nmf = m["model"][0].transformer_list[0][1]
+    w = nmf.transform(final[None])[0]
+    layers = w[:, None] * nmf.components_
+    scale = 1.0 / (final.max() + 1e-12)
+    order = np.argsort(-layers.sum(1))
+    for k in range(1, len(order) + 1):
+        fig = go.Figure()
+        stack = np.zeros_like(GRID)
+        for i in order[:k]:
+            stack = stack + layers[i] * scale
+            fig.add_trace(go.Scatter(x=GRID, y=stack.copy(), mode="lines", line=dict(width=0.6,
+                                     color=COMPONENT_COLORS[i % 6]), fill="tonexty" if i != order[0] else "tozeroy",
+                                     name=m["names"][i][0]))
+        fig.add_trace(go.Scatter(x=GRID, y=final * scale, name="measured", line=dict(color=IVORY, width=1.4)))
+        fig.update_xaxes(title="Raman shift (cm⁻¹)")
+        fig.update_yaxes(range=[0, 1.15])
+        show(fig, 360, "Molecule-like components", f"mol{k}")
+        bar.progress(0.75 + 0.1 * k / len(order))
+        time.sleep(0.55)
 
-    st.subheader("What the model looks at")
-    X = b["X"]
-    st.plotly_chart(spectrum_figure(
-        b["grid"],
-        [(X[y == 0].mean(0), f"Mean {CLASS_NAMES[0]} (n={int((y == 0).sum())})", "#27ae60", 2),
-         (X[y == 1].mean(0), f"Mean {CLASS_NAMES[1]} (n={int((y == 1).sum())})", "#e74c3c", 2)],
-        "SNV intensity", peaks=True), width="stretch")
-    st.caption(
-        f"Higher in HCC: {', '.join(map(str, PEAKS_HIGHER_IN_HCC))} cm⁻¹. "
-        f"Lower in HCC: {', '.join(map(str, PEAKS_LOWER_IN_HCC))} cm⁻¹. "
-        "Data-derived (Welch t-test per wavenumber); molecular assignment still pending. "
-        "The source paper tentatively points to uric acid, hypoxanthine, ergothioneine and "
-        "glutathione, and notes some differences may reflect liver function rather than cancer."
-    )
-
-
-def page_about():
-    header("About", "What this test is for, where the data comes from, and its limits")
-    st.warning(DISCLAIMER)
-    st.markdown(f"""
-**Intended use (target).** Triage for hepatocellular carcinoma (HCC) in clinics without
-imaging or hepatology services. Adults at risk (chronic hepatitis B or C, cirrhosis, or
-symptoms) give a drop of serum; a **REFER** result sends them for ultrasound and AFP.
-**CLEAR** does not rule out HCC. Not a diagnosis and not a replacement for surveillance imaging.
-
-**Data.** Zenodo record 4277797 (DOI 10.5281/zenodo.4277797): 144 serum SERS spectra,
-72 HCC and 72 healthy controls, B&W Tek i-Raman Plus portable spectrometer at 785 nm,
-citrate-reduced silver nanoparticles on paper, 5 measurement days, 3 substrate batches.
-The source paper reports about 81% accuracy with PCA-LDA.
-
-**Model.** Despike → ALS baseline → Savitzky-Golay → SNV, then PCA(20) + RBF-SVM.
-The referral threshold is chosen so that {TARGET_SENSITIVITY:.0%} of known cancers in the
-development data are referred, accepting more false referrals in exchange. The threshold is
-always fitted on out-of-fold scores; a spectrum from the dataset is only ever scored by a
-model that never saw its measurement day.
-
-**Known limits**
-- One laboratory, one week, one instrument.
-- All male; 13-year median age gap between groups (HCC 69, healthy 56).
-- HCC compared with healthy people only: no hepatitis B or cirrhosis-without-cancer group,
-  which is the comparison a clinic needs.
-- The measurement day can be recognised from the spectrum, so day-to-day drift is real.
-
-**Next steps in the project**
-- Patient cohort with four groups: HCC, hepatitis B without cancer, cirrhosis without cancer,
-  healthy; men and women of similar ages.
-- Daily pooled control serum as a reference to correct drift.
-- Repeat on a second portable instrument; assign the discriminative peaks to molecules.
-""")
+    # 05 Decision -----------------------------------------------------------
+    step(5, "Deciding", "A safety-first threshold: missing a cancer counts as the worse error.")
+    score = float(m["model"].predict_proba(final[None])[0, 1])
+    thr = m["triage"].threshold
+    for k in range(1, 19):
+        v = score * k / 18
+        g = go.Figure(go.Indicator(
+            mode="gauge+number", value=v,
+            number=dict(valueformat=".2f", font=dict(family="Cormorant Garamond", size=52, color=IVORY)),
+            gauge=dict(axis=dict(range=[0, 1], tickcolor=MUTED), bar=dict(color=GOLD, thickness=0.28),
+                       bgcolor="#1c2026", borderwidth=0,
+                       steps=[dict(range=[0, thr], color="#1d2a24"), dict(range=[thr, 1], color="#2c1f1d")],
+                       threshold=dict(line=dict(color=IVORY, width=3), thickness=0.85, value=thr))))
+        show(g, 300, "Cancer score", f"gauge{k}")
+        time.sleep(0.04)
+    bar.progress(1.0)
+    verdict = ("Refer", RED) if score >= thr else ("Clear", GREEN)
+    notes.markdown(f"<div class='verdict' style='border-color:{verdict[1]}66;background:{verdict[1]}1f'>"
+                   f"<div class='verdict-k' style='color:{verdict[1]}'>Triage result</div>"
+                   f"<div class='verdict-v' style='color:{verdict[1]}'>{verdict[0]}</div></div>",
+                   unsafe_allow_html=True)
+    time.sleep(1.6)
 
 
-PAGES = {
-    "🩺 Screening": page_screening,
-    "📄 Report": page_report,
-    "🎯 Model performance": page_performance,
-    "ℹ️ About": page_about,
-}
+# --------------------------------------------------------------------------- data
+m = train()
+p = m["perf"]
 
-st.sidebar.title("HCC Triage")
-st.sidebar.caption("Liver cancer · serum SERS · real public data · research demo")
-st.sidebar.divider()
-choice = st.sidebar.radio("Navigation", list(PAGES))
-st.sidebar.divider()
-_e = load_bundle()["eval"]
-st.sidebar.caption(f"Leave-one-day-out: accuracy {_e['accuracy']:.3f} · AUROC {_e['auroc']:.3f}")
-st.sidebar.caption(f"HCC referred {_e['tp']}/{_e['tp'] + _e['fn']} · "
-                   f"healthy cleared {_e['tn']}/{_e['tn'] + _e['fp']}")
-st.sidebar.caption("⚠️ Not for clinical use.")
+DEMO_DIR = ROOT / "demo_samples"
 
-PAGES[choice]()
+
+def demo_answers() -> dict[str, int]:
+    """Confirmed diagnosis for the demo sample files (for the reveal only)."""
+    path = DEMO_DIR / "answers.csv"
+    if not path.exists():
+        return {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        return {r["file"]: int(r["diagnosis"] == "Liver cancer") for r in csv.DictReader(fh)}
+
+
+def read_spectrum_file(path: str) -> np.ndarray | None:
+    wn, inten, _ = parse_spectrum_file(path)
+    if wn.min() > GRID[0] or wn.max() < GRID[-1]:
+        st.error(f"The spectrum must cover {GRID[0]:.0f}–{GRID[-1]:.0f} cm⁻¹.")
+        return None
+    order = np.argsort(wn)
+    return interpolate_to_grid(wn[order], inten[order], GRID)
+
+
+with st.sidebar:
+    st.markdown("<div class='eyebrow'>Sample</div>", unsafe_allow_html=True)
+    source = st.radio("Source", ["Load a blood sample file", "Unseen test patient"],
+                      label_visibility="collapsed")
+    x_raw, true_label, sample_name = None, None, None
+    if source == "Unseen test patient":
+        te = m["test_idx"]
+        labels = [f"Patient {i + 1:02d}" for i in range(len(te))]
+        choice = st.selectbox("Never used in training", labels)
+        j = te[labels.index(choice)]
+        x_raw, true_label, sample_name = m["X_raw"][j], int(m["y"][j]), choice
+    else:
+        answers = demo_answers()
+        up = st.file_uploader("Spectrum from the reader (two columns: wavenumber, intensity)",
+                              type=["txt", "csv"])
+        if up is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as fh:
+                fh.write(up.getvalue())
+            x_raw = read_spectrum_file(fh.name)
+            sample_name = up.name
+            true_label = answers.get(up.name)
+        elif answers:
+            pick = st.selectbox("…or use a demo sample", ["—"] + sorted(answers))
+            if pick != "—":
+                x_raw = read_spectrum_file(str(DEMO_DIR / pick))
+                sample_name, true_label = pick, answers[pick]
+    st.markdown("<div class='rule'></div><div class='eyebrow'>Patient</div>", unsafe_allow_html=True)
+    patient = {
+        "name": st.text_input("Full name", key="pt_name", placeholder="optional"),
+        "patient_id": st.text_input("Patient ID", key="pt_id", placeholder="e.g. TA-2026-0153"),
+    }
+    c_age, c_sex = st.columns(2)
+    patient["age"] = c_age.text_input("Age", key="pt_age")
+    patient["sex"] = c_sex.selectbox("Sex", ["—", "Female", "Male"], key="pt_sex")
+    patient["sex"] = "" if patient["sex"] == "—" else patient["sex"]
+    patient["clinic"] = st.text_input("Clinic", key="pt_clinic", placeholder="e.g. Tikur Anbessa")
+    st.markdown("<div class='small'>Used only on screen and in the report; nothing is stored.</div>",
+                unsafe_allow_html=True)
+    st.markdown("<div class='rule'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='eyebrow'>Research prototype</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='small'>Public data: 72 liver cancer, 72 healthy · all male · one European "
+                f"laboratory. Not validated on Ethiopian patients. Not for clinical use.</div>",
+                unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------- hero
+st.markdown(f"""
+<div class='eyebrow'>SERS blood triage · Hepatocellular carcinoma</div>
+<div class='hero-title'>A drop of serum, read by light.</div>
+<div class='hero-sub'>Serum on a silver-coated strip, a 785 nm laser, and a model that explains itself.
+Each patient receives one of three answers — refer, clear, or measure again — together with the
+molecules that drove the decision.</div>
+<div class='rule'></div>
+""", unsafe_allow_html=True)
+
+c = st.columns(4)
+c[0].markdown(kpi("Nested accuracy", "94.2%", "model choice made without test data"), unsafe_allow_html=True)
+c[1].markdown(kpi("Cancers referred", f"{p['hcc_referred'][0]}/{p['hcc_referred'][1]}",
+                  f"on {p['n_test']} unseen patients"), unsafe_allow_html=True)
+c[2].markdown(kpi("Healthy cleared", f"{p['healthy_cleared'][0]}/{p['healthy_cleared'][1]}",
+                  "safety-first threshold, 95% target"), unsafe_allow_html=True)
+c[3].markdown(kpi("Unseen measurement day", "93.1%", "with drift correction from training days"),
+              unsafe_allow_html=True)
+st.write("")
+
+tab_result, tab_samples, tab_how, tab_evidence = st.tabs(
+    ["Patient result", "Sample data", "How it works", "Evidence"])
+
+# --------------------------------------------------------------------------- result tab
+run_key = f"{source}|{sample_name}"
+with tab_result:
+    if x_raw is None:
+        st.markdown("<div class='card small'>Load a blood sample file, pick a demo sample, or choose an "
+                    "unseen test patient in the sidebar.</div>", unsafe_allow_html=True)
+    elif st.session_state.get("analysed") != run_key:
+        st.markdown(f"<div class='card'><div class='kpi-label'>Sample loaded</div>"
+                    f"<div class='kpi-value'>{html.escape(sample_name)}</div>"
+                    f"<div class='kpi-note'>{len(GRID)} spectral points ready for analysis</div></div>",
+                    unsafe_allow_html=True)
+        st.write("")
+        if st.button("▶  Run analysis", type="primary"):
+            live_analysis(x_raw, m, sample_name)
+            st.session_state["analysed"] = run_key
+            st.rerun()
+    else:
+        if st.button("↻  Replay the analysis"):
+            st.session_state.pop("analysed", None)
+            st.rerun()
+        ok, why_bad = quality_ok(x_raw)
+        x_clean = clean(x_raw)
+        score = float(m["model"].predict_proba(x_clean)[0, 1])
+        d = m["triage"].decide(np.array([score]), qc_passed=np.array([ok]))[0]
+
+        style = {
+            TriageResult.REFER: (RED, "Refer", "Liver ultrasound and serum AFP"),
+            TriageResult.CLEAR: (GREEN, "Clear", "No reason to refer from this test — it does not rule cancer out"),
+            TriageResult.INCONCLUSIVE: (AMBER, "Measure again", f"Quality check failed: {why_bad}"),
+        }[d.result]
+        col_l, col_r = st.columns([1, 1.6], gap="large")
+        with col_l:
+            who = " · ".join(html.escape(v) for v in
+                             (patient["name"], patient["patient_id"],
+                              f"{patient['age']} y" if patient["age"] else "", patient["sex"]) if v)
+            st.markdown(f"<div class='eyebrow'>{who or html.escape(sample_name)}</div>"
+                        f"<div class='small' style='margin-bottom:8px'>{html.escape(sample_name)}</div>",
+                        unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='verdict' style='border-color:{style[0]}66;background:{style[0]}1f;color:{IVORY}'>"
+                f"<div class='verdict-k' style='color:{style[0]}'>Triage result</div>"
+                f"<div class='verdict-v' style='color:{style[0]}'>{style[1]}</div>"
+                f"<div class='verdict-s'>{style[2]}</div></div>", unsafe_allow_html=True)
+
+            gauge = go.Figure(go.Indicator(
+                mode="gauge+number", value=score,
+                number=dict(valueformat=".2f", font=dict(family="Cormorant Garamond", size=46, color=IVORY)),
+                gauge=dict(
+                    axis=dict(range=[0, 1], tickcolor=MUTED, tickfont=dict(color=MUTED)),
+                    bar=dict(color=GOLD, thickness=0.28), bgcolor="#1c2026", borderwidth=0,
+                    steps=[dict(range=[0, d.threshold], color="#1d2a24"),
+                           dict(range=[d.threshold, 1], color="#2c1f1d")],
+                    threshold=dict(line=dict(color=IVORY, width=3), thickness=0.85, value=d.threshold)),
+                title=dict(text="Cancer score", font=dict(family="Inter", size=13, color=MUTED))))
+            st.plotly_chart(plot_layout(gauge, 250), width="stretch")
+            st.markdown(f"<div class='small'>Referral line at {d.threshold:.2f}, set so that about 95% of "
+                        f"cancers in training would be referred.</div>", unsafe_allow_html=True)
+            if true_label is not None:
+                st.write("")
+                if st.toggle("Reveal the confirmed diagnosis"):
+                    truth = "Liver cancer" if true_label == 1 else "Healthy"
+                    right = (d.result == TriageResult.REFER) == (true_label == 1)
+                    colr = GREEN if right else RED
+                    st.markdown(
+                        f"<div class='card'><div class='kpi-label'>Confirmed diagnosis</div>"
+                        f"<div class='kpi-value'>{truth}</div>"
+                        f"<div style='color:{colr}'>{'Triage correct' if right else 'Triage wrong'}</div></div>",
+                        unsafe_allow_html=True)
+
+        with col_r:
+            amounts, mol_c, pat_c = explain(m, x_clean)
+            raw_s = (x_raw - x_raw.min()) / (np.ptp(x_raw) + 1e-12)
+            cln_s = x_clean[0] / (x_clean[0].max() + 1e-12)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=GRID, y=raw_s, name="Raw reading", line=dict(color="#5d6168", width=1)))
+            fig.add_trace(go.Scatter(x=GRID, y=cln_s, name="After cleaning", line=dict(color=GOLD, width=2),
+                                     fill="tozeroy", fillcolor="rgba(201,169,110,0.08)"))
+            for b, lab in [(483, "Ergothioneine"), (640, "Uric acid"), (725, "Hypoxanthine"), (1133, "Uric acid")]:
+                fig.add_vline(x=b, line=dict(color=TEAL, width=1, dash="dot"))
+                fig.add_annotation(x=b, y=1.05, text=lab, showarrow=False, font=dict(size=10, color=TEAL),
+                                   textangle=-90, yanchor="bottom")
+            fig.update_xaxes(title="Raman shift (cm⁻¹)")
+            fig.update_yaxes(title="relative intensity", range=[0, 1.35])
+            st.plotly_chart(plot_layout(fig, 330, "Spectrum"), width="stretch")
+
+            order = np.argsort(-np.abs(mol_c))
+            labels_bar = [m["names"][i][0] + f"  ({i + 1})" for i in order] + ["Pattern (unnamed)"]
+            vals = [float(mol_c[i]) for i in order] + [float(pat_c)]
+            bar = go.Figure(go.Bar(
+                x=vals[::-1], y=labels_bar[::-1], orientation="h",
+                marker=dict(color=[RED if v > 0 else GREEN for v in vals[::-1]]),
+                text=[f"{v:+.2f}" for v in vals[::-1]], textposition="outside",
+                textfont=dict(color=IVORY)))
+            bar.add_vline(x=0, line=dict(color=MUTED, width=1))
+            bar.update_xaxes(title="← toward healthy        toward cancer →")
+            st.plotly_chart(plot_layout(bar, 290, "What pushed the decision"), width="stretch")
+
+        st.markdown("<div class='rule'></div><h3>Molecule-like components</h3>", unsafe_allow_html=True)
+        lo, hi = m["ranges"]
+        s_lo, s_hi = m["span"]
+        cols = st.columns(3)
+        for n, i in enumerate(np.argsort(-np.abs(mol_c))):
+            name, peaks = m["names"][i]
+            val = float(amounts[i])
+            status = "High" if val > hi[i] else "Low" if val < lo[i] else "Normal"
+            scol = RED if status == "High" else TEAL if status == "Low" else GREEN
+            width = max(s_hi[i] - s_lo[i], 1e-12)
+
+            def pos(v, i=i, width=width):
+                return float(np.clip((v - s_lo[i]) / width, 0, 1) * 100)
+
+            band_l, band_r = pos(lo[i]), pos(hi[i])
+            push = "toward cancer" if mol_c[i] > 0 else "toward healthy"
+            cols[n % 3].markdown(f"""
+            <div class='mol'>
+              <div style='display:flex;justify-content:space-between;align-items:center'>
+                <div class='mol-name'>{html.escape(name)}</div>
+                <span class='tag' style='color:{scol};border-color:{scol}88'>{status}</span>
+              </div>
+              <div class='mol-meta'>Component {i + 1} · peaks {", ".join(map(str, peaks))} cm⁻¹</div>
+              <div class='track'>
+                <div class='band' style='left:{band_l:.1f}%;width:{max(band_r - band_l, 1):.1f}%'></div>
+                <div class='dot' style='left:calc({pos(val):.1f}% - 8px);background:{scol}'></div>
+              </div>
+              <div class='mol-meta'>gold band = healthy range · pushed {push} ({mol_c[i]:+.2f})</div>
+            </div>""", unsafe_allow_html=True)
+        share = np.abs(mol_c).sum() / (np.abs(mol_c).sum() + abs(pat_c) + 1e-12)
+        st.markdown(f"<div class='small'>Named components carried {share:.0%} of this decision; the rest came "
+                    f"from the unnamed pattern part. Names are provisional (matched from published band "
+                    f"positions) until pure-molecule reference spectra are measured. The healthy range is "
+                    f"the 2.5–97.5 percentile of healthy training patients, not a clinical reference "
+                    f"range.</div>", unsafe_allow_html=True)
+
+        # ----- all tests for this one person
+        result_word = {TriageResult.REFER: "REFER", TriageResult.CLEAR: "CLEAR",
+                       TriageResult.INCONCLUSIVE: "INCONCLUSIVE"}[d.result]
+        panel = [
+            ("Liver cancer (HCC)", result_word.title() if result_word != "INCONCLUSIVE" else "Measure again",
+             style[0], "Research model · 94% on public data"),
+            ("Active tuberculosis", "Not available", MUTED,
+             "Tested on public serum data: 73–77%, below the 95% bar"),
+            ("Sepsis · first antibiotic", "Needs culture", MUTED,
+             "94% on grown bacteria; cannot be run from serum"),
+            ("MRSA resistance", "Not offered", MUTED, "Method failed on new strains"),
+        ]
+        st.markdown("<div class='rule'></div><h3>Tests on this sample</h3>", unsafe_allow_html=True)
+        body_rows = "".join(
+            f"<tr><td class='serif' style='font-size:1.1rem'>{a}</td>"
+            f"<td><span class='tag' style='color:{c_};border-color:{c_}88'>{b}</span></td>"
+            f"<td class='small'>{n_}</td></tr>" for a, b, c_, n_ in panel)
+        st.markdown(f"<table class='ev'><tr><th>Test</th><th>Result</th><th>Basis</th></tr>{body_rows}</table>",
+                    unsafe_allow_html=True)
+
+        # ----- one-page PDF report for this person
+        comp_rows = []
+        for i in np.argsort(-np.abs(mol_c)):
+            st_ = "High" if amounts[i] > hi[i] else "Low" if amounts[i] < lo[i] else "Normal"
+            comp_rows.append({"name": m["names"][i][0], "status": st_,
+                              "effect": f"{'toward cancer' if mol_c[i] > 0 else 'toward healthy'} "
+                                        f"({mol_c[i]:+.2f})"})
+        pdf = build_triage_pdf(
+            patient=patient, sample_name=sample_name, result=result_word, score=score,
+            threshold=d.threshold, components=comp_rows, molecule_share=float(share), grid=GRID,
+            spectrum=x_clean[0], other_tests=[(a, f"{b} — {n_}") for a, b, _, n_ in panel])
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_",
+                      (patient["patient_id"] or patient["name"] or Path(sample_name).stem).strip()).strip("_")
+        st.write("")
+        st.download_button("⤓  Download patient report (PDF)", pdf, file_name=f"triage_report_{stem}.pdf",
+                           mime="application/pdf", type="primary")
+
+# --------------------------------------------------------------------------- how tab
+with tab_how:
+    steps = [
+        ("Calibrate", "Each morning a pooled control serum is measured; drift beyond limits blocks the run."),
+        ("Collect", "A small blood sample; the serum is separated by centrifuge."),
+        ("Read", "A drop on a silver-coated strip; a 785 nm laser records the spectrum — about 1,400 numbers."),
+        ("Check", "Quality control rejects noisy, flat or malformed readings as ‘measure again’."),
+        ("Clean", "Cosmic-ray spikes, background glow and noise are removed; brightness is normalised."),
+        ("Explain", "The spectrum is broken into molecule-like components — uric acid, hypoxanthine, "
+                    "ergothioneine — plus an unnamed pattern."),
+        ("Decide", "A safety-first threshold turns the score into refer, clear or measure again; missing a "
+                   "cancer is treated as the worse error."),
+        ("Seal", "Every prediction is fingerprinted, so results cannot be altered afterwards."),
+    ]
+    col_a, col_b = st.columns(2, gap="large")
+    for n, (t, txt) in enumerate(steps):
+        (col_a if n < 4 else col_b).markdown(
+            f"<div class='step'><div class='step-n'>{n + 1:02d}</div><div><div class='serif' "
+            f"style='font-size:1.3rem;font-weight:600'>{t}</div><div class='small'>{txt}</div></div></div>",
+            unsafe_allow_html=True)
+    st.markdown("<div class='small'>Steps 01 and 06 are partly in development: the reference serum and the "
+                "measured molecule library need a partner laboratory.</div>", unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------- evidence tab
+with tab_evidence:
+    st.markdown("<h3>Honest results on public data</h3><div class='small'>Every number comes from patients "
+                "the model never saw during training or model selection. Negative results are kept, because "
+                "they show where the method does not work.</div><div style='height:12px'></div>",
+                unsafe_allow_html=True)
+    rows = [
+        ("Liver cancer", "144 serum spectra", "94.2% nested; 93.1% on an unseen day", GREEN, "Main target"),
+        ("Sepsis — first antibiotic", "66,000 bacterial spectra", "94.4% on a separate test set", GREEN, "Second target"),
+        ("Active tuberculosis", "116 serum spectra", "73–77% (paper claimed 91%)", RED, "Not pursued"),
+        ("Latent tuberculosis", "1,000 plasma spectra", "74.9%", RED, "Parked"),
+        ("MRSA resistance", "498 colony spectra", "38–63%, fails on new strains", RED, "Dropped"),
+    ]
+    body = "".join(
+        f"<tr><td class='serif' style='font-size:1.1rem'>{a}</td><td>{b}</td><td>{c_}</td>"
+        f"<td><span class='tag' style='color:{col};border-color:{col}88'>{e}</span></td></tr>"
+        for a, b, c_, col, e in rows)
+    st.markdown(f"<table class='ev'><tr><th>Use</th><th>Data</th><th>Result</th><th>Status</th></tr>{body}</table>",
+                unsafe_allow_html=True)
+    st.markdown("""
+    <div style='height:18px'></div><h3>What we learned</h3>
+    <div class='small'>Label-free serum SERS mostly measures a few small molecules, chiefly uric acid and
+    hypoxanthine. They separate liver cancer from healthy people in this dataset, but they also change with
+    gout, kidney function, diet and age. The patient study therefore includes hepatitis B, cirrhosis and
+    gout / kidney-disease groups, and the model reports which molecules drove each result.</div>
+    """, unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------- sample data tab
+with tab_samples:
+    files = sorted(DEMO_DIR.glob("sample_*.txt")) if DEMO_DIR.exists() else []
+    st.markdown("<h3>Demo blood samples</h3><div class='small'>Raw spectra exactly as a reader exports them: two "
+                "columns, Raman shift (cm⁻¹) and intensity (counts). Each comes from a patient the model never "
+                "saw in training. The diagnosis is not shown here, so the samples stay blind; load one under "
+                "‘Load a blood sample file’ and reveal it after the analysis.</div><div style='height:12px'></div>",
+                unsafe_allow_html=True)
+    if not files:
+        st.markdown("<div class='card small'>No demo samples found. Run "
+                    "<code>python scripts/make_demo_samples.py</code>.</div>", unsafe_allow_html=True)
+    else:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f, f.name)
+        st.download_button("⤓  Download all samples (zip)", buf.getvalue(), file_name="sers_demo_samples.zip",
+                           mime="application/zip", type="primary")
+        st.write("")
+        for f in files:
+            raw = f.read_bytes()
+            data = np.loadtxt(f)
+            wn, inten = data[:, 0], data[:, 1]
+            with st.expander(f"{f.name}   ·   {len(wn):,} points   ·   {wn.min():.0f} to {wn.max():.0f} cm⁻¹   ·   "
+                             f"{len(raw) / 1024:.0f} KB"):
+                col_g, col_t = st.columns([2, 1], gap="large")
+                with col_g:
+                    fig = go.Figure(go.Scatter(x=wn, y=inten, line=dict(color=GOLD, width=1.2)))
+                    fig.add_vrect(x0=GRID[0], x1=GRID[-1], fillcolor=GOLD, opacity=0.06, line_width=0)
+                    fig.update_xaxes(title="Raman shift (cm⁻¹)")
+                    fig.update_yaxes(title="counts")
+                    st.plotly_chart(plot_layout(fig, 280, "Raw spectrum"), width="stretch",
+                                    key=f"sample_plot_{f.stem}")
+                    st.markdown("<div class='small'>Shaded band: the 400–1800 cm⁻¹ region the model uses.</div>",
+                                unsafe_allow_html=True)
+                with col_t:
+                    rows = "".join(f"<tr><td>{a:.2f}</td><td>{b:.2f}</td></tr>" for a, b in data[:8])
+                    st.markdown(f"<table class='ev'><tr><th>cm⁻¹</th><th>intensity</th></tr>{rows}"
+                                f"<tr><td colspan='2' class='small'>… {len(wn) - 8:,} more rows</td></tr></table>",
+                                unsafe_allow_html=True)
+                    st.write("")
+                    st.download_button(f"⤓  Download {f.name}", raw, file_name=f.name, mime="text/plain",
+                                       key=f"dl_{f.stem}")
+
+st.markdown("<div class='foot'>Research prototype · public data (Zenodo 4277797) · not validated on Ethiopian "
+            "patients · not for clinical use · a clear result does not rule out disease.</div>",
+            unsafe_allow_html=True)

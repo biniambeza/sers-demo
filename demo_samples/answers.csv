@@ -1,0 +1,7 @@
+file,diagnosis,app_patient
+sample_A.txt,Liver cancer,Patient 03
+sample_B.txt,Healthy,Patient 01
+sample_C.txt,Healthy,Patient 13
+sample_D.txt,Liver cancer,Patient 05
+sample_E.txt,Healthy,Patient 08
+sample_F.txt,Liver cancer,Patient 14
